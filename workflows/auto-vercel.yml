@@ -1,0 +1,86 @@
+name: Auto-Connect New Repos to Vercel
+
+on:
+  # Run manually from GitHub Actions tab (or phone via GitHub app)
+  workflow_dispatch:
+
+  # Also run every 6 hours as a safety net
+  schedule:
+    - cron: '0 */6 * * *'
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get all org repos
+        id: repos
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "Fetching org repos..."
+          gh repo list Arc-Garde-Project --json name --limit 100 -q '.[].name' > org_repos.txt
+          cat org_repos.txt
+
+      - name: Get existing Vercel projects
+        id: vercel
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_TEAM_ID: ${{ secrets.VERCEL_TEAM_ID }}
+        run: |
+          echo "Fetching Vercel projects..."
+          curl -s -H "Authorization: Bearer $VERCEL_TOKEN" \
+            "https://api.vercel.com/v9/projects?limit=100&teamId=$VERCEL_TEAM_ID" \
+            | jq -r '.projects[].name' > vercel_projects.txt
+          cat vercel_projects.txt
+
+      - name: Connect missing repos to Vercel
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_TEAM_ID: ${{ secrets.VERCEL_TEAM_ID }}
+        run: |
+          SKIP_REPOS=".github AG-Workflow"
+          CREATED=0
+
+          while IFS= read -r repo; do
+            # Skip system repos
+            if echo "$SKIP_REPOS" | grep -qw "$repo"; then
+              echo "⏭ Skipping $repo (system repo)"
+              continue
+            fi
+
+            # Check if already on Vercel
+            if grep -qx "$repo" vercel_projects.txt 2>/dev/null; then
+              echo "✓ $repo already on Vercel"
+              continue
+            fi
+
+            echo "→ Creating Vercel project for: $repo"
+
+            RESPONSE=$(curl -s -X POST \
+              -H "Authorization: Bearer $VERCEL_TOKEN" \
+              -H "Content-Type: application/json" \
+              "https://api.vercel.com/v10/projects?teamId=$VERCEL_TEAM_ID" \
+              -d "{
+                \"name\": \"$repo\",
+                \"framework\": null,
+                \"gitRepository\": {
+                  \"type\": \"github\",
+                  \"repo\": \"Arc-Garde-Project/$repo\"
+                }
+              }")
+
+            # Check result
+            NAME=$(echo "$RESPONSE" | jq -r '.name // empty')
+            ERROR=$(echo "$RESPONSE" | jq -r '.error.message // empty')
+
+            if [ -n "$NAME" ]; then
+              echo "✓ Created: $NAME → https://$NAME.vercel.app"
+              CREATED=$((CREATED + 1))
+            else
+              echo "✗ Failed for $repo: $ERROR"
+            fi
+
+          done < org_repos.txt
+
+          echo ""
+          echo "=== Done: $CREATED new projects created ==="
