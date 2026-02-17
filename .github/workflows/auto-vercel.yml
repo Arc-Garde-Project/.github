@@ -75,20 +75,24 @@ jobs:
               continue
             fi
 
-            # Check if already on Vercel
-            if grep -qx "$repo" vercel_projects.txt 2>/dev/null; then
+            # Check if already on Vercel (lowercase match)
+            LOWER_REPO=$(echo "$repo" | tr '[:upper:]' '[:lower:]')
+            if grep -qix "$LOWER_REPO" vercel_projects.txt 2>/dev/null; then
               echo "✓ $repo already on Vercel"
               continue
             fi
 
-            echo "→ Creating Vercel project for: $repo"
+            # Vercel requires lowercase project names
+            VERCEL_NAME=$(echo "$repo" | tr '[:upper:]' '[:lower:]')
+
+            echo "→ Creating Vercel project for: $repo (as $VERCEL_NAME)"
 
             RESPONSE=$(curl -s -X POST \
               -H "Authorization: Bearer $VERCEL_TOKEN" \
               -H "Content-Type: application/json" \
               "https://api.vercel.com/v10/projects?teamId=$VERCEL_TEAM_ID" \
               -d "{
-                \"name\": \"$repo\",
+                \"name\": \"$VERCEL_NAME\",
                 \"framework\": null,
                 \"gitRepository\": {
                   \"type\": \"github\",
