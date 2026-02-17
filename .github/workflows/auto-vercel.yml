@@ -8,6 +8,9 @@ on:
   schedule:
     - cron: '0 */6 * * *'
 
+permissions:
+  contents: write
+
 jobs:
   sync:
     runs-on: ubuntu-latest
@@ -15,7 +18,7 @@ jobs:
       - name: Get all org repos and ensure README exists
         id: repos
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
           echo "Fetching org repos..."
           gh repo list Arc-Garde-Project --json name,isEmpty --limit 100 > org_repos_raw.json
