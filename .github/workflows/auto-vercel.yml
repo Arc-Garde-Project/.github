@@ -12,13 +12,36 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Get all org repos
+      - name: Get all org repos and ensure README exists
         id: repos
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           echo "Fetching org repos..."
-          gh repo list Arc-Garde-Project --json name --limit 100 -q '.[].name' > org_repos.txt
+          gh repo list Arc-Garde-Project --json name,isEmpty --limit 100 > org_repos_raw.json
+
+          SKIP_INIT=".github AG-Workflow"
+
+          # Initialize empty repos with a README so main branch exists (enforces PR workflow)
+          for row in $(jq -c '.[]' org_repos_raw.json); do
+            name=$(echo "$row" | jq -r '.name')
+            empty=$(echo "$row" | jq -r '.isEmpty')
+
+            if [ "$empty" = "true" ]; then
+              if echo "$SKIP_INIT" | grep -qw "$name"; then
+                echo "⏭ $name is empty but is a system repo, skipping init"
+              else
+                echo "→ Initializing $name with README (empty repo — enforcing PR workflow)"
+                gh api repos/Arc-Garde-Project/$name/contents/README.md \
+                  -X PUT \
+                  -f message="Initialize repo with README" \
+                  -f content="$(echo "# $name" | base64)" \
+                  --silent 2>&1 || echo "  (README may already exist)"
+              fi
+            fi
+          done
+
+          jq -r '.[].name' org_repos_raw.json > org_repos.txt
           cat org_repos.txt
 
       - name: Get existing Vercel projects
