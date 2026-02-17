@@ -35,7 +35,7 @@ jobs:
                 gh api repos/Arc-Garde-Project/$name/contents/README.md \
                   -X PUT \
                   -f message="Initialize repo with README" \
-                  -f content="$(echo "# $name" | base64)" \
+                  -f content="$(printf '# %s\n' "$name" | base64 -w 0)" \
                   --silent 2>&1 || echo "  (README may already exist)"
               fi
             fi
@@ -53,8 +53,9 @@ jobs:
           echo "Fetching Vercel projects..."
           curl -s -H "Authorization: Bearer $VERCEL_TOKEN" \
             "https://api.vercel.com/v9/projects?limit=100&teamId=$VERCEL_TEAM_ID" \
-            | jq -r '.projects[].name' > vercel_projects.txt
-          cat vercel_projects.txt
+            | jq -r '.projects[]?.name // empty' > vercel_projects.txt
+          echo "Vercel projects found:"
+          cat vercel_projects.txt || echo "(none)"
 
       - name: Connect missing repos to Vercel
         env:
