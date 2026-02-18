@@ -1,0 +1,131 @@
+name: Sync GitHub Activity to HubSpot
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/30 * * * *'  # Every 30 minutes
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sync PRs to HubSpot deals
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          HUBSPOT_TOKEN: ${{ secrets.HUBSPOT_TOKEN }}
+        run: |
+          SKIP_REPOS=".github AG-Workflow"
+
+          echo "Fetching org repos..."
+          REPOS=$(gh repo list Arc-Garde-Project --json name --limit 100 -q '.[].name')
+
+          for repo in $REPOS; do
+            # Skip system repos
+            if echo "$SKIP_REPOS" | grep -qw "$repo"; then
+              continue
+            fi
+
+            # Check for open PRs (ready for review)
+            OPEN_PRS=$(gh pr list --repo "Arc-Garde-Project/$repo" --state open --json number,author,createdAt --limit 5 2>/dev/null)
+            OPEN_COUNT=$(echo "$OPEN_PRS" | jq 'length')
+
+            if [ "$OPEN_COUNT" -gt "0" ]; then
+              AUTHOR=$(echo "$OPEN_PRS" | jq -r '.[0].author.login')
+              echo "→ $repo has open PR by $AUTHOR — updating HubSpot to In Review"
+
+              # Search HubSpot for the deal by github_repo
+              SEARCH=$(curl -s -X POST \
+                -H "Authorization: Bearer $HUBSPOT_TOKEN" \
+                -H "Content-Type: application/json" \
+                "https://api.hubapi.com/crm/v3/objects/deals/search" \
+                -d "{
+                  \"filterGroups\": [{
+                    \"filters\": [{
+                      \"propertyName\": \"github_repo\",
+                      \"operator\": \"CONTAINS_TOKEN\",
+                      \"value\": \"$repo\"
+                    }]
+                  }],
+                  \"properties\": [\"dealname\", \"dealstage\", \"github_repo\"]
+                }")
+
+              DEAL_ID=$(echo "$SEARCH" | jq -r '.results[0].id // empty')
+
+              if [ -n "$DEAL_ID" ]; then
+                CURRENT_STAGE=$(echo "$SEARCH" | jq -r '.results[0].properties.dealstage')
+
+                # Only update if not already past In Review (don't move backwards)
+                if [ "$CURRENT_STAGE" = "2616138709" ]; then
+                  curl -s -X PATCH \
+                    -H "Authorization: Bearer $HUBSPOT_TOKEN" \
+                    -H "Content-Type: application/json" \
+                    "https://api.hubapi.com/crm/v3/objects/deals/$DEAL_ID" \
+                    -d "{\"properties\":{\"dealstage\":\"2616138710\"}}" > /dev/null
+
+                  echo "  ✓ Moved to In Review"
+                else
+                  echo "  ⏭ Already past In Review (stage: $CURRENT_STAGE)"
+                fi
+              else
+                echo "  ⚠ No matching deal found in HubSpot"
+              fi
+            fi
+
+            # Check for recently merged PRs (last 2 hours)
+            MERGED_PRS=$(gh pr list --repo "Arc-Garde-Project/$repo" --state merged --json number,author,mergedAt,mergedBy --limit 5 2>/dev/null)
+
+            if [ "$(echo "$MERGED_PRS" | jq 'length')" -gt "0" ]; then
+              LATEST_MERGE=$(echo "$MERGED_PRS" | jq -r '.[0].mergedAt')
+              MERGED_BY=$(echo "$MERGED_PRS" | jq -r '.[0].mergedBy.login')
+              AUTHOR=$(echo "$MERGED_PRS" | jq -r '.[0].author.login')
+
+              # Check if merged within last 2 hours
+              MERGE_EPOCH=$(date -d "$LATEST_MERGE" +%s 2>/dev/null || echo 0)
+              NOW_EPOCH=$(date +%s)
+              DIFF=$(( NOW_EPOCH - MERGE_EPOCH ))
+
+              if [ "$DIFF" -lt "7200" ]; then
+                echo "→ $repo merged by $MERGED_BY (PR by $AUTHOR) — updating HubSpot to Delivered"
+
+                SEARCH=$(curl -s -X POST \
+                  -H "Authorization: Bearer $HUBSPOT_TOKEN" \
+                  -H "Content-Type: application/json" \
+                  "https://api.hubapi.com/crm/v3/objects/deals/search" \
+                  -d "{
+                    \"filterGroups\": [{
+                      \"filters\": [{
+                        \"propertyName\": \"github_repo\",
+                        \"operator\": \"CONTAINS_TOKEN\",
+                        \"value\": \"$repo\"
+                      }]
+                    }],
+                    \"properties\": [\"dealname\", \"dealstage\", \"github_repo\"]
+                  }")
+
+                DEAL_ID=$(echo "$SEARCH" | jq -r '.results[0].id // empty')
+
+                if [ -n "$DEAL_ID" ]; then
+                  CURRENT_STAGE=$(echo "$SEARCH" | jq -r '.results[0].properties.dealstage')
+
+                  # Only update if currently In Build or In Review
+                  if [ "$CURRENT_STAGE" = "2616138709" ] || [ "$CURRENT_STAGE" = "2616138710" ]; then
+                    curl -s -X PATCH \
+                      -H "Authorization: Bearer $HUBSPOT_TOKEN" \
+                      -H "Content-Type: application/json" \
+                      "https://api.hubapi.com/crm/v3/objects/deals/$DEAL_ID" \
+                      -d "{\"properties\":{\"dealstage\":\"2616138711\"}}" > /dev/null
+
+                    echo "  ✓ Moved to Delivered"
+                  else
+                    echo "  ⏭ Not in Build/Review stage (stage: $CURRENT_STAGE)"
+                  fi
+                else
+                  echo "  ⚠ No matching deal found in HubSpot"
+                fi
+              fi
+            fi
+
+          done
+
+          echo ""
+          echo "=== Sync complete ==="
