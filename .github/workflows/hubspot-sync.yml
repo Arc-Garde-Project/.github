@@ -3,7 +3,7 @@ name: Sync GitHub Activity to HubSpot
 on:
   workflow_dispatch:
   schedule:
-    - cron: '*/30 * * * *'  # Every 30 minutes
+    - cron: '*/30 * * * *'
 
 jobs:
   sync:
@@ -14,10 +14,20 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_PAT }}
           HUBSPOT_TOKEN: ${{ secrets.HUBSPOT_TOKEN }}
         run: |
+          set +e  # Do NOT exit on first error — handle errors per-repo
+
           SKIP_REPOS=".github AG-Workflow"
+          ERRORS=0
+          SYNCED=0
+          SKIPPED=0
 
           echo "Fetching org repos..."
           REPOS=$(gh repo list Arc-Garde-Project --json name --limit 100 -q '.[].name')
+
+          if [ -z "$REPOS" ]; then
+            echo "ERROR: Failed to fetch org repos. Exiting."
+            exit 1
+          fi
 
           for repo in $REPOS; do
             # Skip system repos
@@ -25,16 +35,18 @@ jobs:
               continue
             fi
 
-            # Check for open PRs (ready for review)
-            OPEN_PRS=$(gh pr list --repo "Arc-Garde-Project/$repo" --state open --json number,author,createdAt --limit 5 2>/dev/null)
-            OPEN_COUNT=$(echo "$OPEN_PRS" | jq 'length')
+            echo "--- Checking $repo ---"
 
-            if [ "$OPEN_COUNT" -gt "0" ]; then
-              AUTHOR=$(echo "$OPEN_PRS" | jq -r '.[0].author.login')
-              echo "→ $repo has open PR by $AUTHOR — updating HubSpot to In Review"
+            # Check for open PRs (ready for review)
+            OPEN_PRS=$(gh pr list --repo "Arc-Garde-Project/$repo" --state open --json number,author,createdAt --limit 5 2>/dev/null || echo "[]")
+            OPEN_COUNT=$(echo "$OPEN_PRS" | jq 'length' 2>/dev/null || echo "0")
+
+            if [ "$OPEN_COUNT" -gt "0" ] 2>/dev/null; then
+              AUTHOR=$(echo "$OPEN_PRS" | jq -r '.[0].author.login // "unknown"')
+              echo "  Open PR by $AUTHOR"
 
               # Search HubSpot for the deal by github_repo
-              SEARCH=$(curl -s -X POST \
+              SEARCH=$(curl -s --max-time 10 -X POST \
                 -H "Authorization: Bearer $HUBSPOT_TOKEN" \
                 -H "Content-Type: application/json" \
                 "https://api.hubapi.com/crm/v3/objects/deals/search" \
@@ -47,47 +59,55 @@ jobs:
                     }]
                   }],
                   \"properties\": [\"dealname\", \"dealstage\", \"github_repo\"]
-                }")
+                }" 2>/dev/null || echo "{}")
 
-              DEAL_ID=$(echo "$SEARCH" | jq -r '.results[0].id // empty')
+              DEAL_ID=$(echo "$SEARCH" | jq -r '.results[0].id // empty' 2>/dev/null)
 
               if [ -n "$DEAL_ID" ]; then
-                CURRENT_STAGE=$(echo "$SEARCH" | jq -r '.results[0].properties.dealstage')
+                CURRENT_STAGE=$(echo "$SEARCH" | jq -r '.results[0].properties.dealstage // empty')
 
-                # Only update if not already past In Review (don't move backwards)
                 if [ "$CURRENT_STAGE" = "2616138709" ]; then
-                  curl -s -X PATCH \
+                  RESULT=$(curl -s --max-time 10 -X PATCH \
                     -H "Authorization: Bearer $HUBSPOT_TOKEN" \
                     -H "Content-Type: application/json" \
                     "https://api.hubapi.com/crm/v3/objects/deals/$DEAL_ID" \
-                    -d "{\"properties\":{\"dealstage\":\"2616138710\"}}" > /dev/null
+                    -d "{\"properties\":{\"dealstage\":\"2616138710\"}}" 2>/dev/null)
 
-                  echo "  ✓ Moved to In Review"
+                  if echo "$RESULT" | jq -e '.id' > /dev/null 2>&1; then
+                    echo "  -> Moved to In Review"
+                    SYNCED=$((SYNCED + 1))
+                  else
+                    echo "  !! HubSpot PATCH failed for $repo: $RESULT"
+                    ERRORS=$((ERRORS + 1))
+                  fi
                 else
-                  echo "  ⏭ Already past In Review (stage: $CURRENT_STAGE)"
+                  echo "  -- Already past In Build (stage: $CURRENT_STAGE)"
+                  SKIPPED=$((SKIPPED + 1))
                 fi
               else
-                echo "  ⚠ No matching deal found in HubSpot"
+                echo "  -- No matching deal in HubSpot"
+                SKIPPED=$((SKIPPED + 1))
               fi
             fi
 
             # Check for recently merged PRs (last 2 hours)
-            MERGED_PRS=$(gh pr list --repo "Arc-Garde-Project/$repo" --state merged --json number,author,mergedAt,mergedBy --limit 5 2>/dev/null)
+            MERGED_PRS=$(gh pr list --repo "Arc-Garde-Project/$repo" --state merged --json number,author,mergedAt,mergedBy --limit 5 2>/dev/null || echo "[]")
+            MERGED_COUNT=$(echo "$MERGED_PRS" | jq 'length' 2>/dev/null || echo "0")
 
-            if [ "$(echo "$MERGED_PRS" | jq 'length')" -gt "0" ]; then
-              LATEST_MERGE=$(echo "$MERGED_PRS" | jq -r '.[0].mergedAt')
-              MERGED_BY=$(echo "$MERGED_PRS" | jq -r '.[0].mergedBy.login')
-              AUTHOR=$(echo "$MERGED_PRS" | jq -r '.[0].author.login')
+            if [ "$MERGED_COUNT" -gt "0" ] 2>/dev/null; then
+              LATEST_MERGE=$(echo "$MERGED_PRS" | jq -r '.[0].mergedAt // empty')
+              MERGED_BY=$(echo "$MERGED_PRS" | jq -r '.[0].mergedBy.login // "unknown"')
+              AUTHOR=$(echo "$MERGED_PRS" | jq -r '.[0].author.login // "unknown"')
 
               # Check if merged within last 2 hours
               MERGE_EPOCH=$(date -d "$LATEST_MERGE" +%s 2>/dev/null || echo 0)
               NOW_EPOCH=$(date +%s)
               DIFF=$(( NOW_EPOCH - MERGE_EPOCH ))
 
-              if [ "$DIFF" -lt "7200" ]; then
-                echo "→ $repo merged by $MERGED_BY (PR by $AUTHOR) — updating HubSpot to Delivered"
+              if [ "$DIFF" -lt "7200" ] 2>/dev/null; then
+                echo "  Merged by $MERGED_BY (PR by $AUTHOR)"
 
-                SEARCH=$(curl -s -X POST \
+                SEARCH=$(curl -s --max-time 10 -X POST \
                   -H "Authorization: Bearer $HUBSPOT_TOKEN" \
                   -H "Content-Type: application/json" \
                   "https://api.hubapi.com/crm/v3/objects/deals/search" \
@@ -100,27 +120,34 @@ jobs:
                       }]
                     }],
                     \"properties\": [\"dealname\", \"dealstage\", \"github_repo\"]
-                  }")
+                  }" 2>/dev/null || echo "{}")
 
-                DEAL_ID=$(echo "$SEARCH" | jq -r '.results[0].id // empty')
+                DEAL_ID=$(echo "$SEARCH" | jq -r '.results[0].id // empty' 2>/dev/null)
 
                 if [ -n "$DEAL_ID" ]; then
-                  CURRENT_STAGE=$(echo "$SEARCH" | jq -r '.results[0].properties.dealstage')
+                  CURRENT_STAGE=$(echo "$SEARCH" | jq -r '.results[0].properties.dealstage // empty')
 
-                  # Only update if currently In Build or In Review
                   if [ "$CURRENT_STAGE" = "2616138709" ] || [ "$CURRENT_STAGE" = "2616138710" ]; then
-                    curl -s -X PATCH \
+                    RESULT=$(curl -s --max-time 10 -X PATCH \
                       -H "Authorization: Bearer $HUBSPOT_TOKEN" \
                       -H "Content-Type: application/json" \
                       "https://api.hubapi.com/crm/v3/objects/deals/$DEAL_ID" \
-                      -d "{\"properties\":{\"dealstage\":\"2616138711\"}}" > /dev/null
+                      -d "{\"properties\":{\"dealstage\":\"2616138711\"}}" 2>/dev/null)
 
-                    echo "  ✓ Moved to Delivered"
+                    if echo "$RESULT" | jq -e '.id' > /dev/null 2>&1; then
+                      echo "  -> Moved to Delivered"
+                      SYNCED=$((SYNCED + 1))
+                    else
+                      echo "  !! HubSpot PATCH failed for $repo: $RESULT"
+                      ERRORS=$((ERRORS + 1))
+                    fi
                   else
-                    echo "  ⏭ Not in Build/Review stage (stage: $CURRENT_STAGE)"
+                    echo "  -- Not in Build/Review stage (stage: $CURRENT_STAGE)"
+                    SKIPPED=$((SKIPPED + 1))
                   fi
                 else
-                  echo "  ⚠ No matching deal found in HubSpot"
+                  echo "  -- No matching deal in HubSpot"
+                  SKIPPED=$((SKIPPED + 1))
                 fi
               fi
             fi
@@ -128,4 +155,10 @@ jobs:
           done
 
           echo ""
-          echo "=== Sync complete ==="
+          echo "=== Sync complete: $SYNCED updated, $SKIPPED skipped, $ERRORS errors ==="
+
+          # Only fail the workflow if EVERY repo errored (total meltdown)
+          if [ "$ERRORS" -gt "0" ] && [ "$SYNCED" -eq "0" ] && [ "$SKIPPED" -eq "0" ]; then
+            echo "CRITICAL: All repos failed. Check HubSpot token and GitHub PAT."
+            exit 1
+          fi
