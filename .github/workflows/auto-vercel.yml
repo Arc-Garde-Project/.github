@@ -1,15 +1,19 @@
 name: Auto-Connect New Repos to Vercel
 
 on:
-  # Run manually from GitHub Actions tab (or phone via GitHub app)
   workflow_dispatch:
-
-  # Also run every 6 hours as a safety net
   schedule:
     - cron: '0 */6 * * *'
 
 permissions:
   contents: write
+
+concurrency:
+  group: auto-vercel-sync
+  cancel-in-progress: true
+
+env:
+  SKIP_REPOS: ".github AG-Workflow"
 
 jobs:
   sync:
@@ -19,23 +23,37 @@ jobs:
         id: repos
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
+        shell: bash {0}
         run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "ERROR: GH_PAT secret is not set"
+            exit 1
+          fi
+
           echo "Fetching org repos..."
-          gh repo list Arc-Garde-Project --json name,isEmpty --limit 100 > org_repos_raw.json
+          gh repo list Arc-Garde-Project --json name,isEmpty --limit 500 > org_repos_raw.json
 
-          SKIP_INIT=".github AG-Workflow"
+          if [ ! -s org_repos_raw.json ]; then
+            echo "ERROR: Failed to fetch org repos"
+            exit 1
+          fi
 
-          # Initialize empty repos with a README so main branch exists (enforces PR workflow)
+          COUNT=$(jq length org_repos_raw.json)
+          echo "Found $COUNT org repos"
+          if [ "$COUNT" -ge 500 ]; then
+            echo "WARNING: Hit repo limit (500). Some repos may be missing."
+          fi
+
           for row in $(jq -c '.[]' org_repos_raw.json); do
             name=$(echo "$row" | jq -r '.name')
             empty=$(echo "$row" | jq -r '.isEmpty')
 
             if [ "$empty" = "true" ]; then
-              if echo "$SKIP_INIT" | grep -qw "$name"; then
-                echo "⏭ $name is empty but is a system repo, skipping init"
+              if echo "$SKIP_REPOS" | grep -qw "$name"; then
+                echo "-- $name is empty but is a system repo, skipping init"
               else
-                echo "→ Initializing $name with README (empty repo — enforcing PR workflow)"
-                gh api repos/Arc-Garde-Project/$name/contents/README.md \
+                echo "-> Initializing $name with README"
+                gh api "repos/Arc-Garde-Project/$name/contents/README.md" \
                   -X PUT \
                   -f message="Initialize repo with README" \
                   -f content="$(printf '# %s\n' "$name" | base64 -w 0)" \
@@ -45,73 +63,118 @@ jobs:
           done
 
           jq -r '.[].name' org_repos_raw.json > org_repos.txt
-          cat org_repos.txt
+          echo "Repos list written: $(wc -l < org_repos.txt) entries"
 
       - name: Get existing Vercel projects
         id: vercel
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
           VERCEL_TEAM_ID: ${{ secrets.VERCEL_TEAM_ID }}
+        shell: bash {0}
         run: |
-          echo "Fetching Vercel projects..."
-          curl -s -H "Authorization: Bearer $VERCEL_TOKEN" \
-            "https://api.vercel.com/v9/projects?limit=100&teamId=$VERCEL_TEAM_ID" \
-            | jq -r '.projects[]?.name // empty' > vercel_projects.txt
-          echo "Vercel projects found:"
-          cat vercel_projects.txt || echo "(none)"
+          if [ -z "$VERCEL_TOKEN" ] || [ -z "$VERCEL_TEAM_ID" ]; then
+            echo "ERROR: VERCEL_TOKEN or VERCEL_TEAM_ID secret is not set"
+            exit 1
+          fi
+
+          echo "Fetching Vercel projects (with pagination)..."
+          > vercel_projects.txt
+          NEXT=""
+          PAGE=0
+
+          while true; do
+            PAGE=$((PAGE + 1))
+            URL="https://api.vercel.com/v9/projects?limit=100&teamId=$VERCEL_TEAM_ID"
+            if [ -n "$NEXT" ]; then
+              URL="${URL}&until=${NEXT}"
+            fi
+
+            RESPONSE=$(curl -s --max-time 15 -H "Authorization: Bearer $VERCEL_TOKEN" "$URL" 2>/dev/null || echo "{}")
+            echo "$RESPONSE" | jq -r '.projects[]?.name // empty' >> vercel_projects.txt
+
+            NEXT=$(echo "$RESPONSE" | jq -r '.pagination.next // empty' 2>/dev/null)
+            if [ -z "$NEXT" ] || [ "$PAGE" -ge 10 ]; then
+              break
+            fi
+          done
+
+          VCOUNT=$(wc -l < vercel_projects.txt)
+          echo "Vercel projects found: $VCOUNT"
+
+          if [ "$VCOUNT" -eq 0 ]; then
+            echo "WARNING: No Vercel projects found. All repos will be treated as new."
+          fi
 
       - name: Connect missing repos to Vercel
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
           VERCEL_TEAM_ID: ${{ secrets.VERCEL_TEAM_ID }}
+        shell: bash {0}
         run: |
-          SKIP_REPOS=".github AG-Workflow"
+          if [ ! -s org_repos.txt ]; then
+            echo "ERROR: org_repos.txt missing or empty. Aborting."
+            exit 1
+          fi
+
           CREATED=0
+          SKIPPED=0
+          ERRORS=0
 
           while IFS= read -r repo; do
             # Skip system repos
             if echo "$SKIP_REPOS" | grep -qw "$repo"; then
-              echo "⏭ Skipping $repo (system repo)"
+              echo "-- Skipping $repo (system repo)"
               continue
             fi
 
-            # Check if already on Vercel (lowercase match)
+            # Check if already on Vercel (case-insensitive)
             LOWER_REPO=$(echo "$repo" | tr '[:upper:]' '[:lower:]')
-            if grep -qix "$LOWER_REPO" vercel_projects.txt 2>/dev/null; then
-              echo "✓ $repo already on Vercel"
+            if [ -f vercel_projects.txt ] && grep -qix "$LOWER_REPO" vercel_projects.txt 2>/dev/null; then
+              SKIPPED=$((SKIPPED + 1))
               continue
             fi
 
-            # Vercel requires lowercase project names
-            VERCEL_NAME=$(echo "$repo" | tr '[:upper:]' '[:lower:]')
+            VERCEL_NAME="$LOWER_REPO"
+            echo "-> Creating Vercel project for: $repo (as $VERCEL_NAME)"
 
-            echo "→ Creating Vercel project for: $repo (as $VERCEL_NAME)"
+            # Build JSON safely with jq to prevent injection
+            PAYLOAD=$(jq -n \
+              --arg name "$VERCEL_NAME" \
+              --arg repo "Arc-Garde-Project/$repo" \
+              '{name: $name, framework: null, gitRepository: {type: "github", repo: $repo}}')
 
-            RESPONSE=$(curl -s -X POST \
+            RESPONSE=$(curl -s --max-time 15 -X POST \
               -H "Authorization: Bearer $VERCEL_TOKEN" \
               -H "Content-Type: application/json" \
               "https://api.vercel.com/v10/projects?teamId=$VERCEL_TEAM_ID" \
-              -d "{
-                \"name\": \"$VERCEL_NAME\",
-                \"framework\": null,
-                \"gitRepository\": {
-                  \"type\": \"github\",
-                  \"repo\": \"Arc-Garde-Project/$repo\"
-                }
-              }")
+              -d "$PAYLOAD" 2>/dev/null || echo "{}")
 
-            # Check result
-            NAME=$(echo "$RESPONSE" | jq -r '.name // empty')
-            ERROR=$(echo "$RESPONSE" | jq -r '.error.message // empty')
+            NAME=$(echo "$RESPONSE" | jq -r '.name // empty' 2>/dev/null)
+            ERROR=$(echo "$RESPONSE" | jq -r '.error.message // empty' 2>/dev/null)
 
             if [ -n "$NAME" ]; then
-              echo "✓ Created: $NAME → https://$NAME.vercel.app"
+              echo "  Created: $NAME -> https://$NAME.vercel.app"
               CREATED=$((CREATED + 1))
             else
-              echo "✗ Failed for $repo: $ERROR"
+              echo "  Failed for $repo: $ERROR"
+              ERRORS=$((ERRORS + 1))
             fi
+
+            # Rate limit protection
+            sleep 1
 
           done < org_repos.txt
 
           echo ""
-          echo "=== Done: $CREATED new projects created ==="
+          echo "=== Done: $CREATED created, $SKIPPED already on Vercel, $ERRORS errors ==="
+
+          echo "## Auto-Vercel Sync" >> $GITHUB_STEP_SUMMARY
+          echo "- Repos scanned: $(wc -l < org_repos.txt)" >> $GITHUB_STEP_SUMMARY
+          echo "- New projects created: $CREATED" >> $GITHUB_STEP_SUMMARY
+          echo "- Already on Vercel: $SKIPPED" >> $GITHUB_STEP_SUMMARY
+          echo "- Errors: $ERRORS" >> $GITHUB_STEP_SUMMARY
+
+          if [ "$ERRORS" -gt "0" ] && [ "$CREATED" -eq "0" ] && [ "$SKIPPED" -eq "0" ]; then
+            echo "CRITICAL: All repos failed. Check Vercel token."
+            exit 1
+          fi
